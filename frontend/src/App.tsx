@@ -31,6 +31,7 @@ import { usePlantStore } from './stores/plantStore';
 import { useSampleStore } from './stores/sampleStore';
 import { useDisposalStore } from './stores/disposalStore';
 import { useDeviceStore } from './stores/deviceStore';
+import { useRetestStore } from './stores/retestStore';
 
 const { Header, Sider, Content, Footer } = Layout;
 
@@ -66,10 +67,15 @@ export default function App() {
   const subscribeDisposals = useDisposalStore((state) => state.subscribe);
   const loadDevices = useDeviceStore((state) => state.loadDevices);
   const subscribeDevices = useDeviceStore((state) => state.subscribe);
+  const loadBatches = useRetestStore((state) => state.loadBatches);
+  const subscribeBatches = useRetestStore((state) => state.subscribe);
 
   const stats = useSampleStore((state) => state.stats);
   const markedStringIds = useSampleStore((state) => state.markedStringIds);
   const disposals = useDisposalStore((state) => state.disposals);
+  const runningBatchCount = useRetestStore((state) =>
+    state.batches.filter((item) => item.state === 'running').length,
+  );
   const inverters = useDeviceStore((state) => state.inverters);
   const strings = useDeviceStore((state) => state.strings);
 
@@ -81,12 +87,23 @@ export default function App() {
       subscribeSamples();
       subscribeDisposals();
       subscribeDevices();
-      await Promise.all([loadSamples(), loadDisposals(), loadDevices()]);
+      subscribeBatches();
+      await Promise.all([loadSamples(), loadDisposals(), loadDevices(), loadBatches()]);
     })();
     return () => {
       cancelled = true;
     };
-  }, [bootstrap, loadSamples, loadDisposals, loadDevices, subscribeSamples, subscribeDisposals, subscribeDevices]);
+  }, [
+    bootstrap,
+    loadSamples,
+    loadDisposals,
+    loadDevices,
+    loadBatches,
+    subscribeSamples,
+    subscribeDisposals,
+    subscribeDevices,
+    subscribeBatches,
+  ]);
 
   useEffect(() => {
     if (plantError) message.error(`本地数据库异常：${plantError}`);
@@ -130,6 +147,7 @@ export default function App() {
             </span>
             <span>组串 {strings.length} · 失配 {mismatchCount}</span>
             <span>人工标记 {markedStringIds.length} · 待办处置 {pendingDisposals}</span>
+            <span>整箱复测进行中 {runningBatchCount}</span>
           </Space>
         </div>
       </Sider>
@@ -177,6 +195,9 @@ export default function App() {
             </Badge>
             <Badge count={pendingDisposals} showZero color="#d46b08" title="待办处置单">
               <Tag color="#d46b08">待办处置</Tag>
+            </Badge>
+            <Badge count={runningBatchCount} showZero color="#08979c" title="整箱复测进行中批次">
+              <Tag color="#08979c">整箱复测</Tag>
             </Badge>
             <Button size="small" type="primary" onClick={() => navigate(ROUTES.diagnose)}>
               进入排查台

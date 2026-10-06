@@ -15,6 +15,7 @@ import {
   Input,
   InputNumber,
   Popconfirm,
+  Progress,
   Row,
   Segmented,
   Select,
@@ -28,12 +29,14 @@ import {
   DeleteOutlined,
   ExclamationCircleOutlined,
   PlusOutlined,
+  SafetyCertificateOutlined,
   SendOutlined,
 } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import { useDisposalStore } from '../stores/disposalStore';
 import { useDeviceStore } from '../stores/deviceStore';
 import { useSampleStore } from '../stores/sampleStore';
+import { useRetestStore } from '../stores/retestStore';
 import {
   DISPOSAL_STATE_LABEL,
   DISPOSAL_TYPE_LABEL,
@@ -49,6 +52,7 @@ import { formatCurrent, share } from '../utils/unit';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
 import DiscreteBadge from '../components/common/DiscreteBadge';
+import RetestProgressDrawer from '../components/retest/RetestProgressDrawer';
 
 const STATE_COLOR: Record<DisposalState, string> = {
   pending: 'default',
@@ -73,6 +77,20 @@ export default function DisposalList() {
   const plants = useDeviceStore((state) => state.plants);
   const stats = useSampleStore((state) => state.stats);
   const thresholds = useSampleStore((state) => state.thresholds);
+
+  const retestViews = useRetestStore((state) => state.views);
+  const retestBatches = useRetestStore((state) => state.batches);
+  const batchViews = useMemo(() => retestViews(), [retestViews, retestBatches]);
+  const runningBatches = useMemo(
+    () => batchViews.filter((item) => item.state === 'running'),
+    [batchViews],
+  );
+  const finishedBatches = useMemo(
+    () => batchViews.filter((item) => item.state === 'finished'),
+    [batchViews],
+  );
+  const [activeBatchId, setActiveBatchId] = useState('');
+  const activeBatch = batchViews.find((item) => item.id === activeBatchId) ?? null;
 
   /** 处置单视图行：拼接组串上下文并判定消缺 / 逾期（派生自 store 明细，保持响应式） */
   const rows: DisposalViewRow[] = useMemo(
@@ -271,6 +289,51 @@ export default function DisposalList() {
         />
       </div>
 
+      {runningBatches.length > 0 ? (
+        <Card
+          size="small"
+          title={
+            <Space>
+              <SafetyCertificateOutlined style={{ color: '#d46b08' }} />
+              整箱复测进度（{runningBatches.length} 个汇流箱进行中）
+            </Space>
+          }
+          style={{ marginBottom: 14 }}
+          styles={{ body: { padding: 12 } }}
+        >
+          <Space wrap size={[12, 12]}>
+            {runningBatches.map((batch) => (
+              <Card
+                key={batch.id}
+                size="small"
+                hoverable
+                style={{ minWidth: 300 }}
+                onClick={() => setActiveBatchId(batch.id)}
+              >
+                <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                  <span>
+                    {batch.plantName} · {batch.combinerBox}
+                    <span className="gb-hint"> / {batch.inverterModel}</span>
+                  </span>
+                  <Tag color={batch.allRecovered ? 'success' : 'processing'}>
+                    {batch.recoveredCount}/{batch.totalCount} 串恢复
+                  </Tag>
+                </Space>
+                <Progress
+                  percent={batch.progressPercent}
+                  size="small"
+                  status={batch.allRecovered ? 'success' : 'active'}
+                  strokeColor={batch.allRecovered ? '#237804' : '#d46b08'}
+                />
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  {batch.allRecovered ? '全部恢复，可确认结束' : `未恢复原因：${batch.reasonSummary}`}
+                </Typography.Text>
+              </Card>
+            ))}
+          </Space>
+        </Card>
+      ) : null}
+
       <Card size="small" styles={{ body: { padding: 12 } }}>
         {filtered.length === 0 ? (
           <EmptyPanel
@@ -420,6 +483,48 @@ export default function DisposalList() {
 
       <Row gutter={14} style={{ marginTop: 14 }}>
         <Col span={24}>
+          <Card
+            size="small"
+            title={
+              <Space>
+                <SafetyCertificateOutlined style={{ color: '#237804' }} />
+                已结束的整箱复测批次（{finishedBatches.length}）
+              </Space>
+            }
+            styles={{ body: { padding: finishedBatches.length > 0 ? 12 : 24 } }}
+          >
+            {finishedBatches.length === 0 ? (
+              <EmptyPanel
+                title="暂无已结束批次"
+                description="在失配排查工作台对汇流箱发起整箱复测，全部组串恢复后确认结束。"
+              />
+            ) : (
+              <Space wrap size={[12, 12]}>
+                {finishedBatches.map((batch) => (
+                  <Card key={batch.id} size="small" hoverable style={{ minWidth: 280 }} onClick={() => setActiveBatchId(batch.id)}>
+                    <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                      <span>
+                        {batch.combinerBox}
+                        <span className="gb-hint"> / {batch.inverterModel}</span>
+                      </span>
+                      <Tag color="success">
+                        {batch.recoveredCount}/{batch.totalCount} 串恢复
+                      </Tag>
+                    </Space>
+                    <Typography.Paragraph type="secondary" style={{ fontSize: 12, margin: '6px 0 0' }}>
+                      发起 {batch.frozenSampledAt}
+                      {batch.finishedAt ? ` · 结束 ${batch.finishedAt.replace('T', ' ').slice(0, 16)}` : ''}
+                    </Typography.Paragraph>
+                  </Card>
+                ))}
+              </Space>
+            )}
+          </Card>
+        </Col>
+      </Row>
+
+      <Row gutter={14} style={{ marginTop: 14 }}>
+        <Col span={24}>
           <Card size="small" title="按责任人统计（未闭环工作量）" styles={{ body: { padding: 12 } }}>
             {disposals.length === 0 ? (
               <EmptyPanel title="暂无处置单" description="从排查台或本页新建处置单。" />
@@ -556,6 +661,12 @@ export default function DisposalList() {
           </Form>
         ) : null}
       </Drawer>
+
+      <RetestProgressDrawer
+        batch={activeBatch}
+        onClose={() => setActiveBatchId('')}
+        onFinished={() => message.success('整箱复测批次已确认结束')}
+      />
     </div>
   );
 }

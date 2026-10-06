@@ -12,6 +12,7 @@ import type { Inverter } from '../types/inverter';
 import type { PvString } from '../types/string';
 import type { Sample } from '../types/sample';
 import type { Disposal } from '../types/disposal';
+import type { RetestBatch } from '../types/retest';
 import { DEFAULT_THRESHOLDS, type ThresholdRow } from '../types/settings';
 import { ROW_REVISION, type Revisioned } from '../types/persistence';
 import { normalizeCurrent, discreteRate } from './discrete';
@@ -21,7 +22,7 @@ import { nowIso, round, shiftDate, todayDate, uuid } from './format';
 export const DB_NAME = 'gbpvstring';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 export { ROW_REVISION };
 export type { Revisioned };
@@ -32,6 +33,7 @@ export type InverterRow = Inverter & Revisioned;
 export type StringRow = PvString & Revisioned;
 export type SampleRow = Sample & Revisioned;
 export type DisposalRow = Disposal & Revisioned;
+export type RetestBatchRow = RetestBatch & Revisioned;
 
 class PvStringDatabase extends Dexie {
   plants!: Table<PlantRow, string>;
@@ -40,6 +42,7 @@ class PvStringDatabase extends Dexie {
   strings!: Table<StringRow, string>;
   samples!: Table<SampleRow, string>;
   disposals!: Table<DisposalRow, string>;
+  retestBatches!: Table<RetestBatchRow, string>;
   settings!: Table<ThresholdRow, string>;
 
   constructor() {
@@ -57,7 +60,7 @@ class PvStringDatabase extends Dexie {
 
     // v2：新增 revision 行修订号；组串补充 moduleModel 索引，处置单补充 owner 索引；
     //     采样表补充组合索引便于按组串+时间取窗口
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         plants: 'id, name, gridDate, latitude, capacityMWp',
         arrays: 'id, plantId, code, capacityKw',
@@ -96,6 +99,18 @@ class PvStringDatabase extends Dexie {
           await settings.put({ ...DEFAULT_THRESHOLDS, id: 'threshold', updatedAt: nowIso() });
         }
       });
+
+    // v3：新增整箱复测批次表（冻结基准 / 批次状态）
+    this.version(DB_SCHEMA_VERSION).stores({
+      plants: 'id, name, gridDate, latitude, capacityMWp',
+      arrays: 'id, plantId, code, capacityKw',
+      inverters: 'id, arrayId, model, ratedKw',
+      strings: 'id, inverterId, combinerBox, code, moduleModel',
+      samples: 'id, stringId, sampledAt, [stringId+sampledAt]',
+      disposals: 'id, stringId, state, type, owner, dueDate',
+      retestBatches: 'id, inverterId, combinerBox, state, frozenAt',
+      settings: 'id',
+    });
   }
 }
 
@@ -299,15 +314,18 @@ async function seedDatabase(): Promise<void> {
               revision: ROW_REVISION,
             });
 
-            // 每串 4 个采集点：辐照度 780~980 W/m²，制造少量失配组串
+            // 每串 8 个采集点：辐照度 780~980 W/m²，制造少量失配组串
+            // （8 条正好满足整箱复测发起时「最近 8 条归一化电流」的冻结要求）
             const isMismatch = random() > 0.78;
             const isWatch = !isMismatch && random() > 0.6;
             const baseCurrent = round(8.2 + random() * 1.4, 2);
-            for (let point = 0; point < 4; point += 1) {
+            for (let point = 0; point < 8; point += 1) {
               const irradiance = Math.round(780 + random() * 200);
               const drift = isMismatch ? 0.62 + point * 0.03 : isWatch ? 0.86 + point * 0.01 : 0.97 + random() * 0.06;
               const currentA = round(baseCurrent * drift, 2);
-              const sampledAt = `${shiftDate(-1)} ${String(9 + point).padStart(2, '0')}:${point % 2 === 0 ? '15' : '45'}`;
+              const hour = 8 + Math.floor(point / 2);
+              const minute = point % 2 === 0 ? 15 : 45;
+              const sampledAt = `${shiftDate(-1)} ${String(hour).padStart(2, '0')}:${minute}`;
               samples.push({
                 id: `smp-${stringId}-${point + 1}`,
                 stringId,
@@ -379,7 +397,7 @@ async function seedDatabase(): Promise<void> {
 
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.retestBatches, db.settings],
     async () => {
       await db.plants.bulkPut(plants);
       await db.arrays.bulkPut(arrays);
@@ -422,11 +440,11 @@ export async function putPlant(row: PlantRow): Promise<void> {
   await db.plants.put(row);
 }
 
-/** 删除电站：级联清理方阵 → 逆变器 → 组串 → 采集 → 处置单 */
+/** 删除电站：级联清理方阵 → 逆变器 → 组串 → 采集 → 处置单 → 复测批次 */
 export async function removePlant(id: string): Promise<void> {
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.retestBatches],
     async () => {
       const arrays = await db.arrays.where('plantId').equals(id).toArray();
       const arrayIds = arrays.map((item) => item.id);
@@ -442,7 +460,10 @@ export async function removePlant(id: string): Promise<void> {
         await db.samples.where('stringId').anyOf(stringIds).delete();
         await db.disposals.where('stringId').anyOf(stringIds).delete();
       }
-      if (inverterIds.length) await db.strings.where('inverterId').anyOf(inverterIds).delete();
+      if (inverterIds.length) {
+        await db.strings.where('inverterId').anyOf(inverterIds).delete();
+        await db.retestBatches.where('inverterId').anyOf(inverterIds).delete();
+      }
       if (arrayIds.length) await db.inverters.where('arrayId').anyOf(arrayIds).delete();
       await db.arrays.where('plantId').equals(id).delete();
       await db.plants.delete(id);
@@ -467,7 +488,7 @@ export async function putArray(row: ArrayRow): Promise<void> {
 }
 
 export async function removeArray(id: string): Promise<void> {
-  await db.transaction('rw', [db.arrays, db.inverters, db.strings, db.samples, db.disposals], async () => {
+  await db.transaction('rw', [db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.retestBatches], async () => {
     const inverterRows = await db.inverters.where('arrayId').equals(id).toArray();
     const inverterIds = inverterRows.map((item) => item.id);
     const stringRows = inverterIds.length
@@ -478,7 +499,10 @@ export async function removeArray(id: string): Promise<void> {
       await db.samples.where('stringId').anyOf(stringIds).delete();
       await db.disposals.where('stringId').anyOf(stringIds).delete();
     }
-    if (inverterIds.length) await db.strings.where('inverterId').anyOf(inverterIds).delete();
+    if (inverterIds.length) {
+      await db.strings.where('inverterId').anyOf(inverterIds).delete();
+      await db.retestBatches.where('inverterId').anyOf(inverterIds).delete();
+    }
     await db.inverters.where('arrayId').equals(id).delete();
     await db.arrays.delete(id);
   });
@@ -499,7 +523,7 @@ export async function putInverter(row: InverterRow): Promise<void> {
 }
 
 export async function removeInverter(id: string): Promise<void> {
-  await db.transaction('rw', [db.inverters, db.strings, db.samples, db.disposals], async () => {
+  await db.transaction('rw', [db.inverters, db.strings, db.samples, db.disposals, db.retestBatches], async () => {
     const stringRows = await db.strings.where('inverterId').equals(id).toArray();
     const stringIds = stringRows.map((item) => item.id);
     if (stringIds.length) {
@@ -507,6 +531,7 @@ export async function removeInverter(id: string): Promise<void> {
       await db.disposals.where('stringId').anyOf(stringIds).delete();
     }
     await db.strings.where('inverterId').equals(id).delete();
+    await db.retestBatches.where('inverterId').equals(id).delete();
     await db.inverters.delete(id);
   });
 }
@@ -531,9 +556,18 @@ export async function putStrings(rows: StringRow[]): Promise<void> {
 }
 
 export async function removeString(id: string): Promise<void> {
-  await db.transaction('rw', [db.strings, db.samples, db.disposals], async () => {
+  await db.transaction('rw', [db.strings, db.samples, db.disposals, db.retestBatches], async () => {
     await db.samples.where('stringId').equals(id).delete();
     await db.disposals.where('stringId').equals(id).delete();
+    // 复测批次保留冻结记录，仅把被删组串从覆盖范围与基准中摘除
+    const touched = await db.retestBatches.filter((batch) => batch.stringIds.includes(id)).toArray();
+    for (const batch of touched) {
+      await db.retestBatches.put({
+        ...batch,
+        stringIds: batch.stringIds.filter((stringId) => stringId !== id),
+        baselines: batch.baselines.filter((item) => item.stringId !== id),
+      });
+    }
     await db.strings.delete(id);
   });
 }
@@ -577,6 +611,21 @@ export async function removeDisposal(id: string): Promise<void> {
   await db.disposals.delete(id);
 }
 
+/* ============================= 整箱复测批次 ============================= */
+
+export async function listRetestBatches(): Promise<RetestBatchRow[]> {
+  const rows = await db.retestBatches.toArray();
+  return rows.sort((a, b) => b.frozenAt.localeCompare(a.frozenAt));
+}
+
+export async function putRetestBatch(row: RetestBatchRow): Promise<void> {
+  await db.retestBatches.put(row);
+}
+
+export async function removeRetestBatch(id: string): Promise<void> {
+  await db.retestBatches.delete(id);
+}
+
 /* ============================ 阈值配置 ============================ */
 
 export async function getThresholds(): Promise<ThresholdRow> {
@@ -600,6 +649,7 @@ export interface DatabaseSnapshot {
   strings: PvString[];
   samples: Sample[];
   disposals: Disposal[];
+  retestBatches: RetestBatch[];
   thresholds: ThresholdRow;
 }
 
@@ -609,13 +659,14 @@ function stripRevision<T extends Revisioned>(row: T): Omit<T, 'revision'> {
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [plants, arrays, inverters, strings, samples, disposals, thresholds] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, retestBatches, thresholds] = await Promise.all([
     listPlants(),
     listArrays(),
     listInverters(),
     listStrings(),
     listSamples(),
     listDisposals(),
+    listRetestBatches(),
     getThresholds(),
   ]);
   return {
@@ -628,6 +679,7 @@ export async function exportSnapshot(): Promise<DatabaseSnapshot> {
     strings: strings.map(stripRevision),
     samples: samples.map(stripRevision),
     disposals: disposals.map(stripRevision),
+    retestBatches: retestBatches.map(stripRevision),
     thresholds,
   };
 }
@@ -636,7 +688,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
   const rev = <T,>(row: T): T & Revisioned => ({ ...row, revision: ROW_REVISION });
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.retestBatches, db.settings],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -645,6 +697,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
         db.strings.clear(),
         db.samples.clear(),
         db.disposals.clear(),
+        db.retestBatches.clear(),
       ]);
       await db.plants.bulkPut((snapshot.plants ?? []).map(rev));
       await db.arrays.bulkPut((snapshot.arrays ?? []).map(rev));
@@ -652,6 +705,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       await db.strings.bulkPut((snapshot.strings ?? []).map(rev));
       await db.samples.bulkPut((snapshot.samples ?? []).map(rev));
       await db.disposals.bulkPut((snapshot.disposals ?? []).map(rev));
+      await db.retestBatches.bulkPut((snapshot.retestBatches ?? []).map(rev));
       if (snapshot.thresholds) await db.settings.put(snapshot.thresholds);
     },
   );
@@ -661,7 +715,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 export async function resetDatabase(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.settings],
+    [db.plants, db.arrays, db.inverters, db.strings, db.samples, db.disposals, db.retestBatches, db.settings],
     async () => {
       await Promise.all([
         db.plants.clear(),
@@ -670,6 +724,7 @@ export async function resetDatabase(): Promise<void> {
         db.strings.clear(),
         db.samples.clear(),
         db.disposals.clear(),
+        db.retestBatches.clear(),
         db.settings.clear(),
       ]);
     },
@@ -679,15 +734,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数统计，用于页脚与阈值页概览 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [plants, arrays, inverters, strings, samples, disposals] = await Promise.all([
+  const [plants, arrays, inverters, strings, samples, disposals, retestBatches] = await Promise.all([
     db.plants.count(),
     db.arrays.count(),
     db.inverters.count(),
     db.strings.count(),
     db.samples.count(),
     db.disposals.count(),
+    db.retestBatches.count(),
   ]);
-  return { plants, arrays, inverters, strings, samples, disposals };
+  return { plants, arrays, inverters, strings, samples, disposals, retestBatches };
 }
 
 /** 结构版本信息（/settings 页展示） */

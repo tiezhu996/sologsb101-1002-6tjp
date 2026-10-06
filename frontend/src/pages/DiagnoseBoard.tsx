@@ -13,6 +13,7 @@ import {
   Descriptions,
   Drawer,
   Empty,
+  Modal,
   Progress,
   Row,
   Segmented,
@@ -25,11 +26,13 @@ import {
   AimOutlined,
   FileProtectOutlined,
   LineChartOutlined,
+  SafetyCertificateOutlined,
   StarOutlined,
 } from '@ant-design/icons';
 import { useSampleStore } from '../stores/sampleStore';
 import { useDeviceStore } from '../stores/deviceStore';
 import { useDisposalStore } from '../stores/disposalStore';
+import { useRetestStore } from '../stores/retestStore';
 import { useCompareGroup, useStringRank } from '../hooks/useStringRank';
 import type { StringDiscreteStat } from '../types/sample';
 import { DISCRETE_LEVEL_LABEL } from '../types/sample';
@@ -39,6 +42,8 @@ import { shiftDate } from '../utils/format';
 import DiscreteBadge from '../components/common/DiscreteBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
+import RetestStartModal from '../components/retest/RetestStartModal';
+import RetestProgressDrawer from '../components/retest/RetestProgressDrawer';
 import FilterBar, { useFilterValues, useKeywordFilter } from '../components/common/FilterBar';
 
 type SortKey = 'score' | 'discrete' | 'bias';
@@ -55,6 +60,9 @@ export default function DiagnoseBoard() {
   const createDisposal = useDisposalStore((state) => state.createDisposal);
   const disposals = useDisposalStore((state) => state.disposals);
 
+  const retestViews = useRetestStore((state) => state.views);
+  const retestBatches = useRetestStore((state) => state.batches);
+
   const plants = useDeviceStore((state) => state.plants);
   const inverters = useDeviceStore((state) => state.inverters);
   const arrays = useDeviceStore((state) => state.arrays);
@@ -66,6 +74,21 @@ export default function DiagnoseBoard() {
   const [onlySuspicious, setOnlySuspicious] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [detailId, setDetailId] = useState<string>('');
+  const [retestStartOpen, setRetestStartOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [activeBatchId, setActiveBatchId] = useState<string>('');
+  const [retestPrefill, setRetestPrefill] = useState<{ inverterId: string; combinerBox: string }>({
+    inverterId: '',
+    combinerBox: '',
+  });
+
+  const batchViews = useMemo(() => retestViews(), [retestViews, retestBatches]);
+  const runningRetests = useMemo(() => batchViews.filter((item) => item.state === 'running'), [batchViews]);
+  const finishedBatchCount = useMemo(
+    () => batchViews.filter((item) => item.state === 'finished').length,
+    [batchViews],
+  );
+  const activeBatch = batchViews.find((item) => item.id === activeBatchId) ?? null;
 
   const plantFilter = filters.plant ?? [];
   const inverterFilter = filters.inverter ?? [];
@@ -187,6 +210,21 @@ export default function DiagnoseBoard() {
             清空标记（{markedStringIds.length}）
           </Button>
           <Button
+            size="small"
+            icon={<SafetyCertificateOutlined />}
+            onClick={() => {
+              setRetestPrefill({ inverterId: '', combinerBox: '' });
+              setRetestStartOpen(true);
+            }}
+          >
+            整箱复测{runningRetests.length > 0 ? `（${runningRetests.length} 进行中）` : ''}
+          </Button>
+          {finishedBatchCount > 0 ? (
+            <Button size="small" onClick={() => setHistoryOpen(true)}>
+              已结束批次（{finishedBatchCount}）
+            </Button>
+          ) : null}
+          <Button
             type="primary"
             icon={<FileProtectOutlined />}
             disabled={selectedIds.length === 0}
@@ -221,6 +259,51 @@ export default function DiagnoseBoard() {
           hint={`其中 ${totals.markedButNormal} 串当前离散率正常，建议复核`}
         />
       </div>
+
+      {runningRetests.length > 0 ? (
+        <Card
+          size="small"
+          title={`整箱复测进行中（${runningRetests.length} 个汇流箱）`}
+          style={{ marginTop: 14 }}
+          extra={
+            <Button size="small" type="link" onClick={() => setHistoryOpen(true)}>
+              已结束批次（{finishedBatchCount}）
+            </Button>
+          }
+          styles={{ body: { padding: 12 } }}
+        >
+          <Space wrap size={[12, 12]}>
+            {runningRetests.map((batch) => (
+              <Card
+                key={batch.id}
+                size="small"
+                hoverable
+                style={{ minWidth: 260 }}
+                onClick={() => setActiveBatchId(batch.id)}
+              >
+                <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                  <span>
+                    <SafetyCertificateOutlined style={{ color: '#d46b08' }} /> {batch.combinerBox}
+                    <span className="gb-hint"> · {batch.inverterModel}</span>
+                  </span>
+                  <Tag color={batch.allRecovered ? 'success' : 'processing'}>
+                    {batch.recoveredCount}/{batch.totalCount} 串
+                  </Tag>
+                </Space>
+                <Progress
+                  percent={batch.progressPercent}
+                  size="small"
+                  status={batch.allRecovered ? 'success' : 'active'}
+                  strokeColor={batch.allRecovered ? '#237804' : '#d46b08'}
+                />
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  {batch.allRecovered ? '全部恢复，可确认结束' : batch.reasonSummary}
+                </Typography.Text>
+              </Card>
+            ))}
+          </Space>
+        </Card>
+      ) : null}
 
       <FilterBar
         keywordPlaceholder="按组串 / 汇流箱搜索"
@@ -430,33 +513,62 @@ export default function DiagnoseBoard() {
                 <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无数据" />
               ) : (
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                  {rank.boxGroups.slice(0, 6).map((group) => (
-                    <div key={group.key}>
-                      <Space style={{ width: '100%', justifyContent: 'space-between' }}>
-                        <span>
-                          <AimOutlined /> {group.label}
-                          <span className="gb-hint"> · {group.count} 串</span>
-                        </span>
-                        <Typography.Text
-                          type={
-                            group.averageRate >= thresholds.discreteAlarmRate
-                              ? 'danger'
-                              : group.averageRate >= thresholds.discreteWatchRate
-                                ? 'warning'
-                                : 'success'
-                          }
-                        >
-                          {group.averageRate.toFixed(2)}%
-                        </Typography.Text>
-                      </Space>
-                      <Progress
-                        percent={Math.min(100, group.averageRate * 6)}
-                        size="small"
-                        showInfo={false}
-                        strokeColor={group.averageRate >= thresholds.discreteAlarmRate ? '#a8071a' : '#0f7b6c'}
-                      />
-                    </div>
-                  ))}
+                  {rank.boxGroups.slice(0, 6).map((group) => {
+                    const [boxInverterId, boxName] = group.key.split('::');
+                    const running = runningRetests.find(
+                      (item) => item.inverterId === boxInverterId && item.combinerBox === boxName,
+                    );
+                    return (
+                      <div key={group.key}>
+                        <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                          <span>
+                            <AimOutlined /> {group.label}
+                            <span className="gb-hint"> · {group.count} 串</span>
+                          </span>
+                          <Space size={4}>
+                            <Typography.Text
+                              type={
+                                group.averageRate >= thresholds.discreteAlarmRate
+                                  ? 'danger'
+                                  : group.averageRate >= thresholds.discreteWatchRate
+                                    ? 'warning'
+                                    : 'success'
+                              }
+                            >
+                              {group.averageRate.toFixed(2)}%
+                            </Typography.Text>
+                            {running ? (
+                              <Button
+                                size="small"
+                                type="link"
+                                onClick={() => setActiveBatchId(running.id)}
+                              >
+                                复测 {running.recoveredCount}/{running.totalCount}
+                              </Button>
+                            ) : (
+                              <Button
+                                size="small"
+                                type="link"
+                                icon={<SafetyCertificateOutlined />}
+                                onClick={() => {
+                                  setRetestPrefill({ inverterId: boxInverterId, combinerBox: boxName });
+                                  setRetestStartOpen(true);
+                                }}
+                              >
+                                整箱复测
+                              </Button>
+                            )}
+                          </Space>
+                        </Space>
+                        <Progress
+                          percent={Math.min(100, group.averageRate * 6)}
+                          size="small"
+                          showInfo={false}
+                          strokeColor={group.averageRate >= thresholds.discreteAlarmRate ? '#a8071a' : '#0f7b6c'}
+                        />
+                      </div>
+                    );
+                  })}
                 </Space>
               )}
             </Card>
@@ -629,6 +741,63 @@ export default function DiagnoseBoard() {
           </Space>
         )}
       </Drawer>
+
+      <RetestStartModal
+        open={retestStartOpen}
+        initialInverterId={retestPrefill.inverterId}
+        initialCombinerBox={retestPrefill.combinerBox}
+        onClose={() => setRetestStartOpen(false)}
+        onStarted={(batchId) => setActiveBatchId(batchId)}
+      />
+      <RetestProgressDrawer batch={activeBatch} onClose={() => setActiveBatchId('')} />
+      <Modal
+        title={`已结束的整箱复测批次（${finishedBatchCount}）`}
+        open={historyOpen}
+        width={720}
+        footer={null}
+        onCancel={() => setHistoryOpen(false)}
+      >
+        {batchViews.filter((item) => item.state === 'finished').length === 0 ? (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无已结束批次" />
+        ) : (
+          <Table
+            rowKey="id"
+            size="small"
+            pagination={{ pageSize: 6, size: 'small' }}
+            dataSource={batchViews.filter((item) => item.state === 'finished')}
+            columns={[
+              { title: '汇流箱', dataIndex: 'combinerBox', width: 110 },
+              { title: '逆变器', dataIndex: 'inverterModel' },
+              {
+                title: '恢复结果',
+                width: 130,
+                render: (_, row) => (
+                  <Tag color="success">
+                    {row.recoveredCount}/{row.totalCount} 串
+                  </Tag>
+                ),
+              },
+              { title: '发起冻结时间', dataIndex: 'frozenSampledAt', width: 150 },
+              {
+                title: '操作',
+                width: 90,
+                render: (_, row) => (
+                  <Button
+                    size="small"
+                    type="link"
+                    onClick={() => {
+                      setHistoryOpen(false);
+                      setActiveBatchId(row.id);
+                    }}
+                  >
+                    查看冻结基准
+                  </Button>
+                ),
+              },
+            ]}
+          />
+        )}
+      </Modal>
     </div>
   );
 }

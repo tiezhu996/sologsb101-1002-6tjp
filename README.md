@@ -28,6 +28,7 @@ docker compose up -d --build # 代码改动后重建
 - 采集组串电流、电压、辐照度，按汇流箱分组实时计算**离散率**（标准差 / 均值），辐照度不同自动做归一化修正
 - 在失配排查工作台按离散率与电流偏差排序、人工标记可疑组串、追溯同汇流箱与同逆变器对比
 - 下发处置单并回填复测电流，复测达基准 95% 自动判定消缺
+- **整箱复测批次**：在失配排查台按汇流箱发起，发起瞬间冻结每串最近 8 条归一化电流均值；发起后的新读数自动归入批次，每串至少 2 条且均值达冻结基准 95% 才算恢复，全部恢复后确认结束
 - 配置判定阈值、查看 IndexedDB 结构版本并做整库 JSON 导出 / 导入
 
 本项目为**纯前端单页应用**：无后端、无数据库服务、无外部接口，全部数据保存在浏览器 IndexedDB。
@@ -52,8 +53,8 @@ docker compose up -d --build # 代码改动后重建
 | `/plants` | 电站与方阵 | 录入电站与方阵结构，按容量与纬度带筛选 |
 | `/inverters` | 三级设备台账 | 逆变器 / 汇流箱 / 组串树形台账，批量新增组串 |
 | `/samples` | 采集与离散率 | 录入组串电流电压，实时计算离散率并标红越限 |
-| `/diagnose` | 失配排查工作台 | 离散率倒序、标记可疑、同汇流箱 / 同逆变器追溯 |
-| `/disposals` | 处置单 | 清洗 / 更换 / 复测三类单子派工与复测回填 |
+| `/diagnose` | 失配排查工作台 | 离散率倒序、标记可疑、同汇流箱 / 同逆变器追溯、发起整箱复测 |
+| `/disposals` | 处置单 | 清洗 / 更换 / 复测三类单子派工与复测回填、整箱复测进度 |
 | `/settings` | 阈值与版本 | 阈值配置、结构版本、整库 JSON 导出 / 导入 |
 
 ## 五、目录结构
@@ -75,20 +76,21 @@ sologsb101-1002/
         ├── main.tsx             # 入口：ConfigProvider + RouterProvider
         ├── App.tsx              # 应用外壳（侧边导航 + 当前电站上下文）
         ├── styles/main.css
-        ├── types/               # plant.ts array.ts inverter.ts string.ts sample.ts disposal.ts settings.ts persistence.ts
-        ├── stores/              # plantStore.ts deviceStore.ts sampleStore.ts disposalStore.ts
+        ├── types/               # plant.ts array.ts inverter.ts string.ts sample.ts disposal.ts retest.ts settings.ts persistence.ts
+        ├── stores/              # plantStore.ts deviceStore.ts sampleStore.ts disposalStore.ts retestStore.ts
         ├── components/common/   # DiscreteBadge.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
+        ├── components/retest/   # RetestStartModal.tsx RetestProgressDrawer.tsx（排查台与处置单页共用）
         ├── hooks/               # useStringRank.ts useIdbTable.ts
         ├── pages/               # PlantList.tsx DeviceLedger.tsx SampleEntry.tsx DiagnoseBoard.tsx DisposalList.tsx SettingsView.tsx
         ├── router/index.tsx     # 路由表（懒加载页面 + App 布局）
         ├── router/routes.ts     # 叶子模块：仅路径常量，切断 App ⇄ router 循环依赖
-        └── utils/               # discrete.ts unit.ts db.ts export.ts events.ts format.ts
+        └── utils/               # discrete.ts retest.ts unit.ts db.ts export.ts events.ts format.ts
 ```
 
 ## 六、数据存储说明
 
 - **存储介质**：浏览器 IndexedDB，库名 **`gbpvstring`**，通过 Dexie 4.x 封装。
-- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 2`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）。
+- **数据结构版本**：`utils/db.ts` 中 `DB_SCHEMA_VERSION = 3`，并登记了 v1 → v2 的 `upgrade` 迁移（补齐行修订号 `revision`、迁移旧字段 `combinerNo → combinerBox`、写入默认阈值）与 v2 → v3（新增整箱复测批次表 `retestBatches`）。
 - **数据表**：
 
   | 表名 | 实体 | 主要索引 |
@@ -99,10 +101,12 @@ sologsb101-1002/
   | `strings` | 组串 | id / inverterId / combinerBox / code / moduleModel |
   | `samples` | 采集读数 | id / stringId / sampledAt / [stringId+sampledAt] |
   | `disposals` | 处置单 | id / stringId / state / type / owner / dueDate |
+  | `retestBatches` | 整箱复测批次（冻结基准） | id / inverterId / combinerBox / state / frozenAt |
   | `settings` | 阈值配置 | id（固定 `threshold`） |
 
-- **首屏自动播种**：`initDatabase()` 在 `plants` 表为空时写入演示数据（幂等）——2 个电站 × 各 2 个方阵 × 各 1~2 台逆变器 × 若干汇流箱与组串 × 每串 4 个采集点 + 5 张处置单，父子记录通过 `plantId / arrayId / inverterId / stringId` 互相引用。
-- **跨页状态**：全部放在 Zustand store（`plantStore / deviceStore / sampleStore / disposalStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。
+- **整箱复测批次口径**：发起时冻结每串最近 8 条归一化电流均值（同时冻结当时的标准辐照度与 95% 恢复比例）；仅 `sampledAt ≥ 发起时间` 的新读数归入批次（补录旧读数不计入，批次仍保持未完成）；每串至少 2 条新读数、均值 ≥ 冻结基准 95% 才判恢复；同一汇流箱同时只允许一个进行中批次。基准不随后续阈值修改或箱内均值漂移而变化。
+- **首屏自动播种**：`initDatabase()` 在 `plants` 表为空时写入演示数据（幂等）——2 个电站 × 各 2 个方阵 × 各 1~2 台逆变器 × 若干汇流箱与组串 × 每串 8 个采集点 + 5 张处置单，父子记录通过 `plantId / arrayId / inverterId / stringId` 互相引用。
+- **跨页状态**：全部放在 Zustand store（`plantStore / deviceStore / sampleStore / disposalStore / retestStore`），页面只读 store；Dexie 写入后由 `utils/events.ts` 广播，各 store 自动重新拉取。
 - **数据不出浏览器**：容器无状态，不挂载卷、不使用数据库服务。
 
 ## 七、本地开发
