@@ -15,6 +15,7 @@ import {
   Input,
   InputNumber,
   Popconfirm,
+  Progress,
   Row,
   Segmented,
   Select,
@@ -27,6 +28,7 @@ import {
   CheckCircleOutlined,
   DeleteOutlined,
   ExclamationCircleOutlined,
+  LockOutlined,
   PlusOutlined,
   SendOutlined,
 } from '@ant-design/icons';
@@ -34,6 +36,7 @@ import dayjs from 'dayjs';
 import { useDisposalStore } from '../stores/disposalStore';
 import { useDeviceStore } from '../stores/deviceStore';
 import { useSampleStore } from '../stores/sampleStore';
+import { useRetestStore } from '../stores/retestStore';
 import {
   DISPOSAL_STATE_LABEL,
   DISPOSAL_TYPE_LABEL,
@@ -44,11 +47,14 @@ import {
   type DisposalType,
 } from '../types/disposal';
 import type { DisposalRow as DisposalViewRow } from '../types/disposal';
+import type { RetestBatchRow } from '../types/retest';
+import { RETEST_BATCH_STATE_LABEL } from '../types/retest';
 import { shiftDate } from '../utils/format';
 import { formatCurrent, share } from '../utils/unit';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
 import DiscreteBadge from '../components/common/DiscreteBadge';
+import RetestBatchTag from '../components/common/RetestBatchTag';
 
 const STATE_COLOR: Record<DisposalState, string> = {
   pending: 'default',
@@ -73,6 +79,11 @@ export default function DisposalList() {
   const plants = useDeviceStore((state) => state.plants);
   const stats = useSampleStore((state) => state.stats);
   const thresholds = useSampleStore((state) => state.thresholds);
+
+  const batchRows = useRetestStore((state) => state.rows());
+  const finishBatch = useRetestStore((state) => state.finishBatch);
+  const deleteBatch = useRetestStore((state) => state.deleteBatch);
+  const [expandedBatch, setExpandedBatch] = useState<string | null>(null);
 
   /** 处置单视图行：拼接组串上下文并判定消缺 / 逾期（派生自 store 明细，保持响应式） */
   const rows: DisposalViewRow[] = useMemo(
@@ -417,6 +428,183 @@ export default function DisposalList() {
           />
         )}
       </Card>
+
+      <Row gutter={14} style={{ marginTop: 14 }}>
+        <Col span={24}>
+          <Card
+            size="small"
+            title={
+              <Space>
+                <LockOutlined />
+                整箱复测批次进度
+              </Space>
+            }
+            styles={{ body: { padding: 12 } }}
+          >
+            {batchRows.length === 0 ? (
+              <EmptyPanel
+                title="暂无整箱复测批次"
+                description="在失配排查工作台选择汇流箱发起整箱复测：冻结每串基准后，新读数自动归入批次。"
+              />
+            ) : (
+              <Table<RetestBatchRow>
+                rowKey="id"
+                size="small"
+                pagination={false}
+                expandable={{
+                  expandedRowKeys: expandedBatch ? [expandedBatch] : [],
+                  onExpand: (expanded, record) => setExpandedBatch(expanded ? record.id : null),
+                  expandedRowRender: (batch) => (
+                    <Table
+                      rowKey="stringId"
+                      size="small"
+                      pagination={false}
+                      dataSource={batch.strings.map((item) => ({
+                        ...item,
+                        code: strings.find((row) => row.id === item.stringId)?.code ?? '已删除组串',
+                      }))}
+                      columns={[
+                        { title: '组串', dataIndex: 'code', width: 120 },
+                        {
+                          title: '冻结基准（A）',
+                          dataIndex: 'frozenBaselineA',
+                          width: 130,
+                          render: (value: number) => formatCurrent(value),
+                        },
+                        {
+                          title: '批次读数',
+                          width: 100,
+                          render: (_, row) => `${row.batchSampleIds.length} 条`,
+                        },
+                        {
+                          title: '批次均值（A）',
+                          dataIndex: 'batchAvgA',
+                          width: 130,
+                          render: (value: number | null) => (value === null ? '—' : formatCurrent(value)),
+                        },
+                        {
+                          title: '状态与未恢复原因',
+                          render: (_, row) =>
+                            row.recovered === true ? (
+                              <Tag color="success" icon={<CheckCircleOutlined />}>
+                                已恢复
+                              </Tag>
+                            ) : (
+                              <Space size={6}>
+                                <Tag color={row.batchSampleIds.length >= 2 ? 'error' : 'default'}>
+                                  {row.recovered === false ? '未恢复' : '待复测'}
+                                </Tag>
+                                <Typography.Text type="secondary">{row.reason}</Typography.Text>
+                              </Space>
+                            ),
+                        },
+                      ]}
+                    />
+                  ),
+                }}
+                dataSource={batchRows}
+                columns={[
+                  {
+                    title: '状态',
+                    dataIndex: 'state',
+                    width: 100,
+                    render: (value: RetestBatchRow['state']) => (
+                      <Tag color={value === 'ongoing' ? 'processing' : 'default'}>
+                        {RETEST_BATCH_STATE_LABEL[value]}
+                      </Tag>
+                    ),
+                  },
+                  {
+                    title: '汇流箱',
+                    width: 260,
+                    render: (_, row) => (
+                      <span>
+                        {row.plantName} · {row.arrayCode} / {row.inverterModel} · {row.combinerBox}
+                      </span>
+                    ),
+                  },
+                  { title: '责任人', dataIndex: 'owner', width: 100 },
+                  { title: '发起时刻', dataIndex: 'cutoffSampledAt', width: 150 },
+                  {
+                    title: '恢复进度',
+                    width: 220,
+                    render: (_, row) => (
+                      <Space size={8}>
+                        <Progress
+                          percent={row.stringCount === 0 ? 0 : Math.round((row.recoveredCount / row.stringCount) * 100)}
+                          size="small"
+                          style={{ width: 110, marginBottom: 0 }}
+                          status={row.allRecovered ? 'success' : 'active'}
+                        />
+                        <RetestBatchTag batch={row} />
+                      </Space>
+                    ),
+                  },
+                  {
+                    title: '未恢复原因',
+                    render: (_, row) => {
+                      const pending = row.strings.filter((item) => item.recovered !== true);
+                      if (pending.length === 0) return <Typography.Text type="success">全部恢复</Typography.Text>;
+                      const reasons = [...new Set(pending.map((item) => item.reason))].slice(0, 2);
+                      return (
+                        <Space size={4} wrap>
+                          {reasons.map((reason) => (
+                            <Tag key={reason} color="orange">
+                              {reason}
+                            </Tag>
+                          ))}
+                          {pending.length > 0 ? (
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                              共 {pending.length} 串，展开查看
+                            </Typography.Text>
+                          ) : null}
+                        </Space>
+                      );
+                    },
+                  },
+                  {
+                    title: '操作',
+                    width: 180,
+                    render: (_, row) => (
+                      <Space size={2}>
+                        <Button size="small" type="link" onClick={() => setExpandedBatch(row.id)}>
+                          明细
+                        </Button>
+                        {row.state === 'ongoing' ? (
+                          <Button
+                            size="small"
+                            type="link"
+                            disabled={!row.allRecovered}
+                            onClick={async () => {
+                              const ok = await finishBatch(row.id);
+                              if (ok) message.success('批次已确认结束');
+                              else message.warning('仍有组串未恢复，不能结束');
+                            }}
+                          >
+                            确认结束
+                          </Button>
+                        ) : null}
+                        <Popconfirm
+                          title="删除该复测批次？"
+                          description="删除不影响已采集读数。"
+                          okText="删除"
+                          cancelText="取消"
+                          onConfirm={async () => {
+                            await deleteBatch(row.id);
+                            message.success('复测批次已删除');
+                          }}
+                        >
+                          <Button size="small" type="link" danger icon={<DeleteOutlined />} />
+                        </Popconfirm>
+                      </Space>
+                    ),
+                  },
+                ]}
+              />
+            )}
+          </Card>
+        </Col>
+      </Row>
 
       <Row gutter={14} style={{ marginTop: 14 }}>
         <Col span={24}>

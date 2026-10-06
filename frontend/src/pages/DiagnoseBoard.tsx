@@ -16,6 +16,7 @@ import {
   Progress,
   Row,
   Segmented,
+  Select,
   Space,
   Table,
   Tag,
@@ -25,20 +26,25 @@ import {
   AimOutlined,
   FileProtectOutlined,
   LineChartOutlined,
+  LockOutlined,
   StarOutlined,
 } from '@ant-design/icons';
 import { useSampleStore } from '../stores/sampleStore';
 import { useDeviceStore } from '../stores/deviceStore';
 import { useDisposalStore } from '../stores/disposalStore';
+import { useRetestStore } from '../stores/retestStore';
 import { useCompareGroup, useStringRank } from '../hooks/useStringRank';
 import type { StringDiscreteStat } from '../types/sample';
 import { DISCRETE_LEVEL_LABEL } from '../types/sample';
 import { groupKeyOf } from '../utils/discrete';
+import { retestBoxKey } from '../utils/retest';
 import { formatCurrent, formatPercent, share } from '../utils/unit';
 import { shiftDate } from '../utils/format';
 import DiscreteBadge from '../components/common/DiscreteBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StatBadge from '../components/common/StatBadge';
+import RetestBatchModal from '../components/common/RetestBatchModal';
+import RetestBatchTag from '../components/common/RetestBatchTag';
 import FilterBar, { useFilterValues, useKeywordFilter } from '../components/common/FilterBar';
 
 type SortKey = 'score' | 'discrete' | 'bias';
@@ -55,6 +61,10 @@ export default function DiagnoseBoard() {
   const createDisposal = useDisposalStore((state) => state.createDisposal);
   const disposals = useDisposalStore((state) => state.disposals);
 
+  const activeBatches = useRetestStore((state) => state.batches).filter(
+    (item) => item.state === 'ongoing',
+  );
+
   const plants = useDeviceStore((state) => state.plants);
   const inverters = useDeviceStore((state) => state.inverters);
   const arrays = useDeviceStore((state) => state.arrays);
@@ -66,6 +76,8 @@ export default function DiagnoseBoard() {
   const [onlySuspicious, setOnlySuspicious] = useState(false);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [detailId, setDetailId] = useState<string>('');
+  /** 整箱复测弹窗定位的汇流箱（inverterId + combinerBox） */
+  const [retestTarget, setRetestTarget] = useState<{ inverterId: string; combinerBox: string } | null>(null);
 
   const plantFilter = filters.plant ?? [];
   const inverterFilter = filters.inverter ?? [];
@@ -96,6 +108,39 @@ export default function DiagnoseBoard() {
   }, [rank.ranked, keyword, plantFilter, inverterFilter, levelFilter]);
 
   const { sameBox, sameInverter, target } = useCompareGroup(detailId);
+
+  /** 组串 → 其所属汇流箱的进行中复测批次 */
+  const batchOfString = (stringId: string): (typeof activeBatches)[number] | undefined =>
+    activeBatches.find((batch) => batch.strings.some((item) => item.stringId === stringId));
+
+  /** 汇流箱候选：逆变器/汇流箱去重，用于整箱复测发起 */
+  const boxOptions = useMemo(() => {
+    const seen = new Map<string, { inverterId: string; combinerBox: string; label: string; count: number }>();
+    for (const stat of rank.ranked) {
+      if (!stat.inverterId) continue;
+      if (scopedPlant && stat.plantId !== scopedPlant) continue;
+      if (scopedInverter && stat.inverterId !== scopedInverter) continue;
+      const key = retestBoxKey(stat.inverterId, stat.combinerBox);
+      const inverter = inverters.find((item) => item.id === stat.inverterId);
+      const array = arrays.find((item) => item.id === inverter?.arrayId);
+      const prev = seen.get(key);
+      if (prev) prev.count += 1;
+      else {
+        seen.set(key, {
+          inverterId: stat.inverterId,
+          combinerBox: stat.combinerBox,
+          label: `${array?.code ?? '-'} / ${inverter?.model ?? '-'} / ${stat.combinerBox}`,
+          count: 1,
+        });
+      }
+    }
+    return [...seen.values()];
+  }, [rank.ranked, inverters, arrays, scopedPlant, scopedInverter]);
+
+  /** 当前筛选范围下是否所有汇流箱都有进行中批次（用于发起按钮文案） */
+  const activeBatchKeys = new Set(
+    activeBatches.map((item) => retestBoxKey(item.inverterId, item.combinerBox)),
+  );
 
   const detailSamples = useMemo(
     () => (detailId ? samplesOfString(detailId).slice(-10) : []),
@@ -185,6 +230,41 @@ export default function DiagnoseBoard() {
           </Button>
           <Button size="small" onClick={clearMarks} disabled={markedStringIds.length === 0}>
             清空标记（{markedStringIds.length}）
+          </Button>
+          <Select
+            size="small"
+            placeholder="整箱复测：选择汇流箱"
+            style={{ minWidth: 280 }}
+            value={null}
+            options={boxOptions.map((item) => {
+              const key = retestBoxKey(item.inverterId, item.combinerBox);
+              const running = activeBatchKeys.has(key);
+              return {
+                value: key,
+                label: `${running ? '〔进行中〕' : ''}${item.label}（${item.count} 串）`,
+              };
+            })}
+            onSelect={(value) => {
+              if (typeof value !== 'string') return;
+              const hit = boxOptions.find(
+                (item) => retestBoxKey(item.inverterId, item.combinerBox) === value,
+              );
+              if (hit) setRetestTarget({ inverterId: hit.inverterId, combinerBox: hit.combinerBox });
+            }}
+          />
+          <Button
+            type="primary"
+            ghost
+            icon={<LockOutlined />}
+            disabled={boxOptions.length === 0}
+            onClick={() => {
+              // 无筛选时默认打开排第一的汇流箱；有进行中批次也能打开查看进度
+              const first = boxOptions[0];
+              if (first) setRetestTarget({ inverterId: first.inverterId, combinerBox: first.combinerBox });
+              else message.warning('暂无可复测的汇流箱');
+            }}
+          >
+            整箱复测{activeBatches.length > 0 ? `（${activeBatches.length} 批进行中）` : ''}
           </Button>
           <Button
             type="primary"
@@ -341,6 +421,25 @@ export default function DiagnoseBoard() {
                     },
                   },
                   {
+                    title: '整箱复测',
+                    width: 150,
+                    render: (_, row) => {
+                      const batch = batchOfString(row.stringId);
+                      if (!batch) return <span className="gb-hint">—</span>;
+                      const progress = batch.strings.find((item) => item.stringId === row.stringId);
+                      return (
+                        <Space size={4} direction="vertical" style={{ lineHeight: 1.2 }}>
+                          <RetestBatchTag batch={batch} />
+                          {progress && progress.recovered !== true ? (
+                            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                              {progress.reason}
+                            </Typography.Text>
+                          ) : null}
+                        </Space>
+                      );
+                    },
+                  },
+                  {
                     title: '操作',
                     width: 190,
                     fixed: 'right',
@@ -388,6 +487,67 @@ export default function DiagnoseBoard() {
 
         <Col xs={24} xl={8}>
           <Space direction="vertical" size={14} style={{ width: '100%' }}>
+            <Card
+              size="small"
+              title={
+                <Space>
+                  <LockOutlined />
+                  整箱复测批次
+                </Space>
+              }
+              extra={
+                <Button
+                  size="small"
+                  type="link"
+                  disabled={boxOptions.length === 0}
+                  onClick={() => {
+                    const first = boxOptions[0];
+                    if (first) setRetestTarget({ inverterId: first.inverterId, combinerBox: first.combinerBox });
+                  }}
+                >
+                  发起
+                </Button>
+              }
+              styles={{ body: { padding: 12 } }}
+            >
+              {activeBatches.length === 0 ? (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description="暂无进行中批次，选择汇流箱发起整箱复测"
+                />
+              ) : (
+                <Space direction="vertical" size={10} style={{ width: '100%' }}>
+                  {activeBatches.map((batch) => {
+                    const inverter = inverters.find((item) => item.id === batch.inverterId);
+                    const recovered = batch.strings.filter((item) => item.recovered === true).length;
+                    const total = batch.strings.length;
+                    return (
+                      <div key={batch.id}>
+                        <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                          <Button
+                            type="link"
+                            size="small"
+                            style={{ paddingInline: 0 }}
+                            onClick={() =>
+                              setRetestTarget({ inverterId: batch.inverterId, combinerBox: batch.combinerBox })
+                            }
+                          >
+                            {inverter?.model ?? '-'} · {batch.combinerBox}
+                          </Button>
+                          <RetestBatchTag batch={batch} />
+                        </Space>
+                        <Progress
+                          percent={total === 0 ? 0 : Math.round((recovered / total) * 100)}
+                          size="small"
+                          status={recovered === total ? 'success' : 'active'}
+                        />
+                      </div>
+                    );
+                  })}
+                </Space>
+              )}
+            </Card>
+
             <Card size="small" title="Top 榜（最可疑 12 串）" styles={{ body: { padding: 12 } }}>
               {rank.top.length === 0 ? (
                 <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无数据" />
@@ -621,6 +781,14 @@ export default function DiagnoseBoard() {
               >
                 生成处置单
               </Button>
+              <Button
+                icon={<LockOutlined />}
+                onClick={() =>
+                  setRetestTarget({ inverterId: target.inverterId, combinerBox: target.combinerBox })
+                }
+              >
+                整箱复测
+              </Button>
               <Button onClick={() => toggleMark(target.stringId)}>
                 {markedStringIds.includes(target.stringId) ? '取消标记' : '标记可疑'}
               </Button>
@@ -629,6 +797,13 @@ export default function DiagnoseBoard() {
           </Space>
         )}
       </Drawer>
+
+      <RetestBatchModal
+        open={Boolean(retestTarget)}
+        inverterId={retestTarget?.inverterId ?? ''}
+        combinerBox={retestTarget?.combinerBox ?? ''}
+        onClose={() => setRetestTarget(null)}
+      />
     </div>
   );
 }
